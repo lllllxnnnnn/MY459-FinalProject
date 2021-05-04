@@ -1,0 +1,163 @@
+---
+title: "Sentiment Analysis of Shake Airbnb Dataset_part A"
+author: "23267"
+date: "3/17/2021"
+output:
+  html_document:
+    code_folding: show
+    highlight: tango
+    theme: cosmo
+    toc: yes
+    toc_depth: 3
+    number_section: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Preparation
+
+```{r warning=FALSE, message = FALSE}
+library(tidyverse)
+library(tidytext)
+library(tm)
+library(wordcloud)
+library(plotly)
+```
+
+# Data Clean
+
+```{r}
+
+food <- read.csv("AB_BEIJING_reviews.csv")
+food$name <- as.character(food$name)
+# food
+```
+
+# Data Component
+
+```{r}
+food %>% str()
+```
+
+# Analysis
+
+## Tokeninization
+
+```{r}
+tidy_food <- food %>% 
+  mutate(linenumber = row_number()) %>%
+  ungroup() %>% 
+  unnest_tokens(word, name)
+```
+
+```{r}
+# tidy_food <- 
+#   tidy_food %>% 
+#   dplyr::select(-Title)
+```
+
+## Sentiment Analysis
+
+```{r}
+tidy_review <- food %>% 
+  unnest_tokens(word, name)
+```
+
+### Visualization
+
+```{r}
+word_count <- 
+  tidy_review %>% 
+  inner_join(get_sentiments("bing")) %>% 
+  count(word, sentiment)
+
+top_words <- 
+  word_count %>% 
+  group_by(sentiment) %>% 
+  top_n(15) %>%
+  ungroup() %>%
+  mutate(word = reorder(word, n))
+
+ggplot(top_words, aes(word, n, fill = sentiment)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~sentiment, scales = "free") +  
+  coord_flip() + 
+  labs(x = "Word", y = "", 
+       title = "Most Frequently Used Words")
+```
+
+```{r}
+food_bing <- 
+  tidy_food %>% 
+  inner_join(get_sentiments("bing"))
+
+food_bing <- 
+  food_bing %>% 
+  group_by(Brand) %>% 
+  count(sentiment)
+PR.bar <- food_bing %>% 
+  group_by(Brand) %>% 
+  mutate(Total = sum(n)) %>% 
+  ungroup() %>% 
+  ggplot(aes(x = Brand, y = n, fill = sentiment, 
+             text = paste("Brand:", Brand,
+                          "<br>Sentiment:", sentiment, 
+                          "<br>Ratio", round(n/Total*100, digits = 1), "%"))) +
+  geom_bar(stat = "identity", position = "fill") +
+  labs(y = "Ratio", 
+       title = "Which Brands has the most Positive Reputations?") +
+  scale_fill_discrete(name = "Sentiment",
+                      breaks = c("positive","negative"),
+                      labels = c("Positive", "Negative"))
+ggplotly(PR.bar, tooltip="text")
+```
+
+### `Top 30 Positive words`
+
+```{r}
+top_words_30 <- 
+  word_count %>% 
+  group_by(sentiment) %>% 
+  top_n(30) %>%
+  ungroup() %>%
+  mutate(word = reorder(word, n))
+
+ggplot(top_words_30 %>% 
+         filter(sentiment == "positive"), 
+       aes(word, n, fill = sentiment)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~sentiment, scales = "free") +  
+  coord_flip() + 
+  labs(x = "Word", y = "", 
+       title = "Most Frequently Used Positive Words")
+```
+
+### WordCloud Visualization
+
+Create a function.
+
+```{r}
+make_word_cloud <- function(documents) {
+  corpus = Corpus(VectorSource(tolower(documents)))
+  corpus = tm_map(corpus, removePunctuation)
+  corpus = tm_map(corpus, removeWords, stopwords("english"))
+  
+  frequencies = DocumentTermMatrix(corpus)
+  word_frequencies = as.data.frame(as.matrix(frequencies))
+  
+  words <- colnames(word_frequencies)
+  freq <- colSums(word_frequencies)
+  wordcloud(words, freq, max.words =1000,
+            min.freq=sort(freq, decreasing=TRUE)[[400]],
+            colors=brewer.pal(8, "Dark2"),
+            random.color=TRUE)  
+}
+```
+
+```{r warning = FALSE, error = FALSE}
+make_word_cloud(food %>% 
+  select(name))
+```
+

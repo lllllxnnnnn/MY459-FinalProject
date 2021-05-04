@@ -1,0 +1,582 @@
+---
+title: "MY459"
+author: "23267"
+date: "05/04/2020"
+output: 
+  pdf_document:
+    latex_engine: xelatex
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# --> Modify to your working directory before run <--
+knitr::opts_knit$set(base.dir = '/Users/utility/Desktop')
+library(tidyverse)
+library(mice)
+library(VIM)
+library(leaflet)
+library(ggplot2)
+library(mapdeck)
+library(dplyr)
+library(caTools)
+library(lmtest)
+library(rpart)
+library(keras)
+library(leafletCN)
+library(leaflet.providers)
+library(jsonify)
+library(colourvalues)
+library(lubridate)
+library(scales)
+library(shiny)
+library(NLP)
+library(tm)
+library(RColorBrewer)
+library(wordcloud)
+library(tmap)
+
+```
+
+
+```{r}
+listings <- read.csv('listings.csv', stringsAsFactors = F, encoding = 'UTF-8', na.strings = c('N/A'))
+
+names(listings)
+str(listings)
+# summary(listings)
+```
+
+
+```{r}
+useful_columns <- c('id','host_id','host_since','host_acceptance_rate',"host_is_superhost", 'host_listings_count','host_verifications','host_has_profile_pic','host_identity_verified', 'street','neighbourhood','neighbourhood_cleansed','zipcode','market','latitude','longitude','is_location_exact','property_type', 'room_type','accommodates','bathrooms','bedrooms','beds','bed_type','square_feet','price','weekly_price','monthly_price', 'security_deposit','cleaning_fee','guests_included','extra_people','minimum_nights','maximum_nights','availability_365', 'number_of_reviews','review_scores_rating','review_scores_accuracy','review_scores_cleanliness','review_scores_checkin', 'review_scores_communication','review_scores_location','review_scores_value')
+length(useful_columns)
+listings <- listings[, useful_columns]
+```
+
+
+```{r}
+aggr(listings)
+md.pattern(listings)
+
+#Drop the columns that contain too much missing data
+dropcol <- c('neighbourhood','zipcode','market','square_feet','weekly_price','monthly_price','security_deposit','cleaning_fee','review_scores_rating','review_scores_accuracy','review_scores_cleanliness','review_scores_checkin','review_scores_communication','review_scores_location','review_scores_value','host_acceptance_rate','host_response_rate')
+listings[, dropcol] = NULL
+
+aggr(listings)
+
+listings = listings[complete.cases(listings), ]
+str(listings)
+
+aggr(listings)
+
+
+```
+
+
+
+```{r}
+# Date
+listings$host_since <- as.Date(listings$host_since)
+
+# Host_since
+listings$host_since <- as.Date(listings$host_since)
+
+# Price 
+listings$price = gsub(',', '', listings$price)
+listings$price = substring(listings$price,2,nchar(listings$price))
+listings$price = as.numeric(listings$price)
+str(listings$price)
+
+# Extra people 
+listings$extra_people = gsub(',', '', listings$extra_people)
+listings$extra_people = substring(listings$extra_people, 2, nchar(listings$extra_people))
+listings$extra_people = as.numeric(listings$extra_people)
+str(listings$extra_people)
+
+
+#Host_listing_time
+dim(filter(listings, listings$host_listings_count == 0))
+listings = filter(listings, listings$host_listings_count != 0)
+
+```
+
+
+```{r fig.height=3.5, fig.width=3.5}
+num_variable = c('host_listings_count','latitude','longitude','accommodates','bathrooms','bedrooms','beds','price','guests_included', 'extra_people','minimum_nights','maximum_nights','availability_365','number_of_reviews')
+par(mfrow = c(4, 4))
+for (i in num_variable){
+  x = listings[,i]
+  print(ggplot(listings, aes(x = x)) + geom_histogram(stat = 'count') + ggtitle(label = i))
+}
+
+for (i in num_variable){
+  x = listings[, i]
+  print(ggplot(listings, aes(x = x)) + geom_boxplot() + ggtitle(label = i))
+}
+
+remove_outliers = c('host_listings_count','accommodates','bathrooms','bedrooms','beds','price')
+
+# Replace values
+replace_outliers = function(data) {
+  qnt = quantile(data, probs = c(.25,.75), na.rm = T)
+  cap = quantile(data, probs = c(.05,.95), na.rm = T)
+  Th = 1.5 * IQR(data, na.rm = T)
+  cleandata = ifelse((data < (qnt[1] - Th)), cap[1], data)
+  cleandata = ifelse((data > (qnt[2] + Th)), cap[2], data)
+  return(cleandata)
+}
+for (i in remove_outliers){
+  listings[,i] <- replace_outliers(listings[, i])
+}
+#replace column extra_people individually 
+listings$extra_people = ifelse(listings$extra_people >500, 500, listings$extra_people)
+
+
+#replace column minimun night, maximum night individually 
+listings$minimum_nights = ifelse(listings$minimum_nights > 365, 365, listings$minimum_nights)
+listings$maximum_nights = ifelse(listings$maximum_nights > 1125, 1125, listings$maximum_nights)
+
+#replace column bathrooms,bedrooms,beds individually
+a = c('bathrooms','bedrooms','beds')
+for (i in a){
+  x = listings[,i]
+  listings[,i] = ifelse(listings[,i] < 1, 1, listings[,i])
+}
+
+#replot the data to check 
+for (i in num_variable){
+  x = listings[, i]
+  print(ggplot(listings, aes(x = x)) + geom_boxplot() + ggtitle(label = i))
+}
+```
+
+
+```{r}
+#host since 
+listings$host_since_year = year(listings$host_since)
+str(listings$host_since_year)
+listings$datecut = cut(listings$host_since_year,breaks = c(2009, 2012, 2014, 2016, 2018, 2020),
+                             labels = c('2010-2012','2012-2014','2014-2016','2016-2018','After2018'))
+ggplot(listings,aes(x=datecut,y = price,fill = datecut)) + geom_boxplot() + scale_y_continuous(limits = c(0, 8000))+ggtitle(label = 'Price at different hosting time')
+
+
+#host_listing_count
+ggplot(listings, aes(x = host_listings_count)) + geom_histogram() 
+listings$host_listings_cut = cut(listings$host_listings_count,breaks = c(0, quantile(listings$host_listings_count,0.2), 
+                                                                         quantile(listings$host_listings_count,0.4), 
+                                                                         quantile(listings$host_listings_count,0.6),
+                                                                         quantile(listings$host_listings_count,0.8),
+                                                                        quantile(listings$host_listings_count,1)))
+ggplot(listings,aes(x=host_listings_cut,y = price,fill = host_listings_cut)) + geom_boxplot()+ggtitle(label = 'Price at different hosting listing count')
+
+
+#Location 
+listings$latitude_cut = cut(listings$latitude,breaks = c(0, quantile(listings$latitude,0.2), 
+                                                                         quantile(listings$latitude,0.4), 
+                                                                         quantile(listings$latitude,0.6),
+                                                                         quantile(listings$latitude,0.8),
+                                                                        quantile(listings$latitude,1)))
+listings$longitude_cut = cut(listings$longitude,breaks = c(0, quantile(listings$longitude,0.2), 
+                                                                         quantile(listings$longitude,0.4), 
+                                                                         quantile(listings$longitude,0.6),
+                                                                         quantile(listings$longitude,0.8),
+                                                                        quantile(listings$longitude,1)))
+
+ggplot(listings,aes(x = latitude_cut, y = longitude_cut,fill=price))+geom_tile()+ggtitle(label = "Location")+scale_fill_gradient2(low ="yellow", high ="red", mid ="orange")
+
+#Guest included
+listings$guests_included_cut = cut(listings$guests_included,breaks = c(0,3,6,9,12,16),labels = c('0-3','3-6','6-9','9-12','12-16'))
+ggplot(listings,aes(x=guests_included_cut,y = price,fill = guests_included_cut)) + geom_boxplot()+ggtitle(label = 'Guest Included')
+
+#Extra people
+ggplot(listings, aes(x = extra_people)) + geom_histogram() 
+listings$extra_people_cut = cut(listings$extra_people,breaks = c(-1, quantile(listings$extra_people,0.72), 
+                                                                         quantile(listings$extra_people,0.8),
+                                                                         quantile(listings$extra_people,0.9),
+                                                                        quantile(listings$extra_people,1)))
+
+ggplot(listings,aes(x=extra_people_cut,y = price,fill = extra_people_cut)) + geom_boxplot()+ggtitle(label = 'Extra_people')
+
+#Number of reviews
+ggplot(listings, aes(x = number_of_reviews)) + geom_histogram() 
+listings$number_of_reviews_cut = cut(listings$number_of_reviews,breaks = c(-1, quantile(listings$number_of_reviews,0.5), 
+                                                                         quantile(listings$number_of_reviews,0.7),
+                                                                         quantile(listings$number_of_reviews,0.8),
+                                                                        quantile(listings$number_of_reviews,1)))
+
+ggplot(listings,aes(x=number_of_reviews_cut,y = price,fill = number_of_reviews_cut)) + geom_boxplot()+ggtitle(label = 'Number of reviews')
+
+#Other feature
+plot_column = c("host_is_superhost","host_identity_verified","neighbourhood_cleansed",
+                "property_type","room_type","accommodates","bathrooms","bedrooms","beds","bed_type")
+
+for (i in plot_column){
+  x = as.character(listings[, i])
+  print(ggplot(listings, aes(x = x,y = price, fill = x)) + geom_boxplot() + ggtitle(label = i))
+}
+
+```
+
+
+```{r}
+library(stringr)
+library(leafletCN)
+cleanDistrict <- function(s) {
+  return(str_extract(s, "[\\p{Han}]+"))
+}
+listings$district <- sapply(listings$neighbourhood_cleansed, cleanDistrict)
+unique(listings$neighbourhood_cleansed)
+fixErrorInNeibourhood <- function(s) {
+  if (s == '东城区') return('东城区 / Dongcheng')
+  if (s == '西城区') return('西城区 / Xicheng')
+  if (s == '海淀区') return('海淀区 / Haidian')
+  if (s == '房山区') return('房山区 / Fangshan')
+  if (s == '石景山区') return('石景山区 / Shijingshan')
+  if (s == '昌平区') return('昌平区 / Changping')
+  return(s)
+}
+listings$neighbourhood_cleansed <- sapply(listings$neighbourhood_cleansed, fixErrorInNeibourhood)
+unique(listings$neighbourhood_cleansed)
+```
+
+
+```{r}
+leaflet(listings) %>%
+  addTiles() %>%
+  addMarkers(~longitude, ~latitude, labelOptions = labelOptions(noHide = F), clusterOptions = markerClusterOptions(), popup = paste0("<b> Host ID: </b>", listings$host_id , "<br/><b> Rating: </b>", listings$review_scores_rating, "<br> <b> Price: </b>", listings$price, "<br/><b> Room Type: </b>", listings$room_type, "<br/><b> Property Type: </b>", listings$property_type)) %>% 
+  setView(lat = 39.9, lng = 116.38, zoom = 10) %>%
+  addProviderTiles("CartoDB.Positron")
+```
+
+```{r}
+mean_price <- listings %>% group_by(district) %>% summarise(mean_price = mean(price)) %>% arrange(desc(mean_price))
+mean_price$district <- as.character(mean_price$district)
+
+print(mean_price)
+
+beijing_districs <- data.frame(regionNames("北京"))
+colnames(beijing_districs) <- "district"
+geo_data <- full_join(beijing_districs, mean_price)
+map <- leafletGeo("北京", geo_data)
+pal <- colorNumeric(palette = "Blues", domain = map$value)
+
+leaflet(map) %>% amap() %>%
+    addPolygons(stroke = TRUE,
+                smoothFactor = 1,
+                fillOpacity = 0.7,
+                weight = 1,
+                color = ~pal(value),
+                popup = ~htmltools::htmlEscape(popup)
+    ) %>%
+    addLegend("bottomright", pal = pal, values = ~value,
+              title = "Average Price by Districts",
+              labFormat = leaflet::labelFormat(prefix = ""),
+              opacity = 1)
+```
+
+```{r}
+mean_rating <- listings %>% group_by(district) %>% summarise(mean_rating = mean(review_scores_rating, na.rm = T)) %>% arrange(desc(mean_rating))
+mean_rating$district <- as.character(mean_rating$district)
+
+print(mean_rating)
+
+geo_data <- full_join(beijing_districs, mean_rating)
+map <- leafletGeo("北京", geo_data)
+pal <- colorNumeric(palette = "Blues", domain = map$value)
+
+leaflet(map) %>% amap() %>%
+    addPolygons(stroke = TRUE,
+                smoothFactor = 1,
+                fillOpacity = 0.7,
+                weight = 1,
+                color = ~pal(value),
+                popup = ~htmltools::htmlEscape(popup)
+    ) %>%
+    addLegend("bottomright", pal = pal, values = ~value,
+              title = "Average Rating by Districts",
+              labFormat = leaflet::labelFormat(prefix = ""),
+              opacity = 1)
+
+```
+
+```{r}
+count_houses <- listings %>% group_by(district) %>% summarise(count = n()) %>% arrange(desc(count))
+count_houses$district <- as.character(count_houses$district)
+
+print(count_houses)
+
+geo_data <- full_join(beijing_districs, count_houses)
+map <- leafletGeo("北京", geo_data)
+pal <- colorNumeric(palette = "Blues", domain = map$value)
+
+leaflet(map) %>% amap() %>%
+    addPolygons(stroke = TRUE,
+                smoothFactor = 1,
+                fillOpacity = 0.7,
+                weight = 1,
+                color = ~pal(value),
+                popup = ~htmltools::htmlEscape(popup)
+    ) %>%
+    addLegend("bottomright", pal = pal, values = ~value,
+              title = "Houses Counts by Districts",
+              labFormat = leaflet::labelFormat(prefix = ""),
+              opacity = 1)
+
+````
+
+```{r}
+mapdeck(style = mapdeck_style('light'), pitch = 45, zoom = 10) %>%
+  add_hexagon(
+    data = listings
+    , lat = "latitude"
+    , lon = "longitude"
+    , layer_id = "hex_layer"
+    , elevation_scale = 100
+    , legend = TRUE
+    , colour_range = colourvalues::colour_values(1:6, palette = colourvalues::get_palette("viridis")[70:256,])
+  )
+```
+
+```{r}
+listings %>% group_by(property_type) %>% summarise(counts = n()) %>% arrange(desc(counts))
+```
+
+```{r}
+selected_districts <- c("朝阳区 / Chaoyang","东城区 / Dongcheng","海淀区 / Haidian", "怀柔区 / Huairou", "延庆县 / Yanqing", "门头沟区 / Mentougou")
+center_city <- c("朝阳区 / Chaoyang","东城区 / Dongcheng","海淀区 / Haidian")
+selected_property_type <- c("Apartment", "House", "Condominium", "Serviced apartment", "Loft")
+
+head(listings)
+a =listings %>% group_by(host_is_superhost)%>% summarise(mean = mean(price))
+
+sum = summarise(a,sum(Freq))
+a = a %>% mutate(ratio = Freq/as.numeric(sum))
+a
+sum = summarise(a,sum(Freq))
+as.numeric(sum)
+a1 = a[1:6,]
+a1
+```
+
+```{r}
+selected_districts2 <- c("朝阳区 / Chaoyang","东城区 / Dongcheng","海淀区 / Haidian", "西城区 / Xicheng", "丰台区 / Fengtai", "通州区 / Tongzhou")
+
+selected_districts3 <- c("怀柔区 / Huairou","房山区 / Fangshan","延庆县 / Yanqing", "石景山区 / Shijingshan", "门头沟区 / Mentougou", "平谷区 / Pinggu")
+
+property <- listings %>% group_by(neighbourhood_cleansed, property_type) %>% summarise(Freq = n())
+property <- property %>% filter(property_type %in% selected_property_type) %>% filter(neighbourhood_cleansed %in% selected_districts2) %>% mutate(city_center_or_subrub = ifelse(neighbourhood_cleansed %in% center_city, 1, 0))
+
+total_property <- listings %>% filter(property_type %in% selected_property_type) %>% filter(neighbourhood_cleansed %in% selected_districts2) %>% group_by(neighbourhood_cleansed) %>% summarise(sum = n()) %>% mutate(city_center_or_subrub = ifelse(neighbourhood_cleansed %in% center_city, 1, 0))
+
+property_ratio <- merge(property, total_property, by="neighbourhood_cleansed")
+property_ratio <- property_ratio %>% mutate(ratio = Freq/sum) 
+
+ggplot(a, aes(x = host_is_superhost, y = mean, fill = host_is_superhost)) +
+  geom_bar(stat="identity")  +
+  ggtitle("Score of reviews of different hosts") +
+  xlab("neighbourhood_cleansed") + ylab("Price")
+
+```
+
+
+
+```{r}
+property <- listings %>% group_by(neighbourhood_cleansed, property_type) %>% summarise(Freq = n())
+property <- property %>% filter(property_type %in% selected_property_type) %>% filter(neighbourhood_cleansed %in% selected_districts) %>% mutate(city_center_or_subrub = ifelse(neighbourhood_cleansed %in% center_city, 1, 0))
+
+total_property <- listings %>% filter(property_type %in% selected_property_type) %>% filter(neighbourhood_cleansed %in% selected_districts) %>% group_by(neighbourhood_cleansed) %>% summarise(sum = n()) %>% mutate(city_center_or_subrub = ifelse(neighbourhood_cleansed %in% center_city, 1, 0))
+
+property_ratio <- merge(property, total_property, by="neighbourhood_cleansed")
+property_ratio <- property_ratio %>% mutate(ratio = Freq/sum)
+
+ggplot(property_ratio, aes(x = neighbourhood_cleansed, y = ratio, fill = property_type)) +
+  geom_bar(position = "dodge", stat = "identity") + xlab("District") + ylab("Ratio") +
+  scale_fill_discrete(name = "Property Type") + 
+  scale_y_continuous(labels = scales::percent) +
+  ggtitle("Different Property Ratio in City Center and Suburb") +
+  theme(text = element_text(family = "AdobeSongStd-Light")) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 0.6)) +
+  theme(plot.caption = element_text(color = "grey68")) + scale_color_gradient(low = "#d3cbcb", high = "#852eaa") +
+  scale_fill_manual("Property Type", values = c("#e06f69","#357b8a", "#7db5b8", "#59c6f3", "#f6c458")) +
+  xlab("District") + ylab("Percentage")
+
+ggplot(property_ratio, aes(x = neighbourhood_cleansed, y = sum, fill = neighbourhood_cleansed)) +
+  geom_bar(position = "dodge", stat="identity") + 
+  scale_fill_discrete(name = "Districts") +
+  ggtitle("House Counts in Six Different Districts") +
+  theme(text = element_text(family = "AdobeSongStd-Light")) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 0.6)) +
+  xlab("District") + ylab("Count")
+  
+```
+
+```{r fig.width=5}
+average_price_by_type <- listings %>% group_by(property_type, neighbourhood_cleansed) %>% summarise(avg_price = mean(price))
+average_price_by_type <- average_price_by_type %>% filter(property_type %in% selected_property_type) %>% filter(neighbourhood_cleansed %in% selected_districts)
+
+ggplot(average_price_by_type, aes(x = property_type, y = avg_price, fill = property_type)) +
+  geom_bar(position = "dodge", stat="identity") +
+  facet_grid(~ neighbourhood_cleansed) +
+  ggtitle("Average Price by Property Type in Different Districts") +
+  theme(text = element_text(family = "AdobeSongStd-Light")) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 0.6)) +
+  xlab("District") + ylab("Price")
+```
+
+
+```{r}
+reviews_num <- reviews %>% group_by(date = date) %>% summarise(number = n())
+
+ggplot(reviews_num, aes(date, number)) +
+  geom_point(na.rm=TRUE, color = "#007A87", alpha=0.5) + 
+  geom_smooth(color = 'red') +
+  ggtitle("The demonds of Airbnb among several years") +
+  labs(x = "Year", y = "Number of reviews") 
+```
+We find that the number of reviews increased rapidly over the recent years, which indicates the same scope of increasement in the demands. Also we can find obvious seasonality in the demands.
+
+We choose the data in 2017 and 2018 seperately, and to find more about the seasonality.
+```{r}
+review_num_2017 <- reviews_num %>% filter(year(date) == 2017)
+review_num_2018 <- reviews_num %>% filter(year(date) == 2018)
+
+ggplot(review_num_2017, aes(date, number)) +
+  geom_point(na.rm=TRUE, color = "#007A87", alpha=0.5) + 
+  geom_smooth(color = 'red') +
+  ggtitle("The demonds of Airbnb in 2017") +
+  labs(x = "Year", y = "Number of reviews") 
+
+ggplot(review_num_2018, aes(date, number)) +
+  geom_point(na.rm=TRUE, color = "#007A87", alpha=0.5) + 
+  geom_smooth(color = 'red') +
+  ggtitle("The demonds of Airbnb in 2018") +
+  labs(x = "Year", y = "Number of reviews") 
+```
+
+## Apply models and analyse
+Setting x, y and data preparing.
+```{r}
+# Specify outcome variable and independent variables and the using data here
+# -----------------------------------------------
+outcome <- "price"
+variables <- c("host_listings_count","guests_included","extra_people","neighbourhood_cleansed","property_type","room_type","accommodates","bathrooms","bedrooms","beds","bed_type")
+data <- listings
+# -----------------------------------------------
+
+f <- as.formula(paste(outcome, paste(variables, collapse = " + "), sep = " ~ "))
+
+# Strength of correlation
+cor(listings[c(outcome, variables)] %>% select_if(is.numeric))
+# Scatter plot matrix
+pairs(as.formula(paste("", paste(c(num_variable, outcome), collapse = " + "), sep = "~")), 
+      data = data, main = "Scatter Plot Matrix")
+
+split_data <- sample.split(data[, outcome], SplitRatio = 0.9)
+train_set <- data[split_data,]
+test_set <- data[!split_data,]
+```
+
+### Linear Regression
+```{r}
+# Fit model
+start <- lm(f, data = train_set)
+smallest <- formula(lm(as.formula(paste(outcome, "1", sep = " ~ ")), data = train_set))
+lr_model <- step(start, direction = "backward", trace = FALSE, scope = smallest)
+summary(lr_model)
+
+# Residuals check
+plot(lr_model)
+
+# Auto-correlation test ~ Durbin Watson test
+dwtest(lr_model)
+
+# Model accuracy comparison using test/ train data
+res_test <- predict(lr_model, test_set) - test_set[outcome]
+plot(res_test$price)
+hist(res_test$price)
+
+sqrt(mean(res_test$price^2))
+```
+
+### Decision tree
+```{r}
+tree_model <- rpart(f, data = data, method = "anova")
+
+pr <- (predict(tree_model, test_set) - test_set[outcome]) / test_set[outcome]
+sqrt(mean(pr$price^2))
+```
+
+### Nerual Network
+```{r}
+# Check if Keras is available
+is_keras_available()
+
+# Split X and Y of data
+x_train <- train_set[variables]
+y_train <- train_set[outcome]
+x_test <- test_set[variables]
+y_test <- test_set[outcome]
+
+# Creating the sequential model
+nn_model <- keras_model_sequential() %>%   
+  layer_dense(units = 6, activation = "relu", input_shape = ncol(x_train)) %>%
+  layer_dense(units = 4, activation = "relu") %>%
+  layer_dense(units = ncol(y_train))
+summary(nn_model)
+
+# Train model
+compile(nn_model, loss = "mse", optimizer = optimizer_sgd(), metrics = "mae")
+history <- fit(nn_model, data.matrix(x_train), data.matrix(y_train), epochs = 20, batch_size = 32, verbose = 1)
+plot(history)
+
+# Perform prediction
+y_pred <- predict(nn_model, data.matrix(x_test))
+
+result_mae <- mean(abs(y_pred - data.matrix(y_test)))
+result_mae
+```
+
+```{r}
+#wordcloud
+
+sampledreviews <- read.csv('AB_BEIJING_reviews.csv')
+splitsampledreviewscoloumn <- unlist(strsplit(as.character(sampledreviews$name), split=" "))
+reviewsWordDF <- data.frame("word" = splitsampledreviewscoloumn)
+wordDF <- reviewsWordDF %>% count(word,sort = TRUE) %>% ungroup()
+
+docs <- Corpus(VectorSource(splitsampledreviewscoloumn))
+docs <- tm_map(docs, content_transformer(tolower))
+docs <- tm_map(docs, removeWords, stopwords("english"))
+docs = tm_map(docs,removePunctuation)
+docs <- tm_map(docs, removeWords, c(' ',"we","it", "overall", "this", "airbnb", "thanks", "also","is", "the","of","well","beijing","great","one","really",'and','to','nice'))
+newcorpusdf <- data.frame(text=sapply(docs, identity),stringsAsFactors=F)
+newcorpusdffiltered <- newcorpusdf %>% filter(text != "")
+wordDF <- newcorpusdf %>% count(text, sort = TRUE) %>% ungroup()
+
+set.seed(789)
+wordcloud(words = wordDF$text,
+          freq = wordDF$n,
+          min.freq = 1000,
+          max.words=500, colors = c("#e06f69","#357b8a", "#7db5b8", "#59c6f3"))
+
+r = getOption("repos")
+r["CRAN"] = "http://cran.us.r-project.org"
+options(repos = r)
+library('text2vec')
+tokens <- space_tokenizer(as.character(sampledreviews$name))
+it = itoken(tokens, progressbar = FALSE)
+# vocab <- create_vocabulary(it)
+# vectorizer <- vocab_vectorizer(vocab)
+# use window of 5 for context words
+tcm <- create_tcm(it, vectorizer, skip_grams_window = 5L)
+
+glove = GlobalVectors$new(rank = 50, x_max = 20,learning_rate = 0.15,alpha = 0.75,
+                          lambda = 0.0, shuffle = FALSE)
+
+# `glove` object will be modified by `fit()` call !
+word_vectors = glove$fit_transform(tcm, n_iter = 20)
+word_vectors1 <- glove$components
+```

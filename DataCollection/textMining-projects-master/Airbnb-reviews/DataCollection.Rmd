@@ -1,0 +1,712 @@
+---
+title: "Downloading and Pre-processing"
+date: "04/05/2020"
+output:
+  word_document: default
+  html_document: default
+editor_options:
+  chunk_output_type: inline
+---
+
+
+```{r setup, eval=TRUE}
+#rm(list = ls()) # cleans the memory
+knitr::opts_chunk$set(eval = FALSE)
+library(XML)
+library(rvest)
+library(stringr)
+library(dplyr)
+library(tm) # Quantitative Discourse Analysis Package
+library(ggplot2)
+library(tidyr)
+library(RCurl) # download files
+library(readr) # read from zip
+library(stringr)
+library(RSQLite)
+library(cld3)
+library(tidytext)
+library(sentimentr)
+library(textclean)
+library(qdapDictionaries)
+library(udpipe)
+library(textfeatures)
+library(lubridate)
+library(magrittr)
+```
+
+### Downloading
+
+```{r get paths, eval=FALSE}
+# ----- Set the working directory
+# setwd("/Users/utility/Desktop/textMining-projects-master")
+
+# ----- Get info from the webpage
+url_airbnb <- 'http://insideairbnb.com/get-the-data.html'
+get_the_data <- read_html(url_airbnb)
+tables <- get_the_data %>% html_nodes("table")
+
+# ----- Get urls
+cities_table <- data.frame()
+for (i in 1:102) {
+  table_h <- tables[[i]] %>% html_table()
+  all_links <- tables[[i]] %>% html_nodes("a") %>% html_attr("href")
+  table_h$links <- all_links
+  cities_table <- plyr::rbind.fill(cities_table, table_h)
+}
+
+# ----- Normalise the column names
+colnames(cities_table) <- gsub(" |/", "_", colnames(cities_table)) %>% tolower()
+
+# ----- Normalise the date format
+lct <- Sys.getlocale("LC_TIME")
+Sys.setlocale("LC_TIME", "C")
+cities_table$date_compiled <- as.Date(cities_table$date_compiled, format = "%d %b,%Y")
+
+# ----- Get the latest listing file for each city
+listings_data <- cities_table %>%
+  group_by(country_city) %>%
+  arrange(desc(date_compiled)) %>%
+  filter(grepl("Detailed Listings",description)) %>%
+  top_n(1)
+
+# ----- Get the latest review files
+reviews_data <- cities_table %>%
+  group_by(country_city) %>%
+  arrange(desc(date_compiled)) %>%
+  filter(grepl("Detailed Review",description)) %>%
+  top_n(1)
+
+```
+
+```{r get paths, eval=FALSE}
+# ----- Get calendar files which contain information before 2020
+calendar_data <- cities_table %>%
+  mutate(year = lubridate::year(date_compiled)) %>%
+  group_by(country_city) %>%
+  arrange(desc(date_compiled)) %>%
+  filter(grepl("Detailed Calendar",description),
+         year <= 2020) 
+```
+
+
+```{r download files, message=FALSE, eval=FALSE}
+# ----- Set the downloading directory
+datafolder <- "/Users/utility/Desktop/textMining-projects-master/airbnb_file"
+setwd(datafolder)
+```
+
+
+```{r download files, message=FALSE, eval=FALSE}
+# ----- Download listing files
+for (i in 1:nrow(listings_data)) {
+  tryCatch(download.file(url = listings_data$links[i], destfile = paste0(datafolder, "/listings/", tolower(listings_data$country_city[i]), "_listings.csv.gz"), quiet = T), error = function(e) print("file did not work"))
+}
+
+# ----- Download review files
+for (i in 1:nrow(reviews_data)) {
+  tryCatch(download.file(url = reviews_data$links[i], destfile = paste0(datafolder, "/reviews/", tolower(reviews_data$country_city[i]), "_reviews.csv.gz"), quiet = T), error = function(e) print("file did not work"))
+}
+# ----- Download calendar files
+for (i in 1:nrow(calendar_data)) {
+  tryCatch(download.file(url = calendar_data$links[i],destfile = paste0(datafolder, "/calendar/", calendar_data$date_compiled[i], "_", tolower(calendar_data$country_city[i]),"_calendar.csv.gz"), quiet = T), error = function(e) print("file did not work"))
+}
+```
+
+### Extracting, Transforming, and Loading data to a relational schema
+
+> The reviewer can write reviews for listings, which are owned by hosts and have calendars.
+
+```{r ETL investigation, message=FALSE, eval=FALSE}
+# ----- Pre-ETL investigation to get all columns and select the columns needed
+
+# Create a function to make a sample of 1 row from each dataset and combine them to get an idea what columns we have
+get_sample <- function(folder_path, pattern) {
+
+  listed_files <- list.files(folder_path, pattern = pattern)
+  main_df <- data.frame()
+
+  for (i in 1:length(listed_files)) {
+    
+    file_path <-paste(folder_path, listed_files[i],sep="/")
+    local_df <- read_csv(file_path, n_max = 1)
+    local_df$file_name <-listed_files[i]
+    local_df$pre_processed <- 0
+    main_df <- plyr::rbind.fill(main_df, local_df)
+    
+  }
+
+return(main_df)
+
+}
+
+# Generate the sample
+listings_sample <- get_sample(folder_path = "listings", pattern = "listings.csv.gz")
+reviews_sample <- get_sample(folder_path = "reviews", pattern = "reviews.csv.gz")
+calendar_sample <- get_sample(folder_path = "calendar", pattern = "calendar.csv.gz")
+reviews_sample$date <- as.Date(reviews_sample$date)
+```
+
+```{r create ETL function for listings, eval=FALSE}
+# ----- Initiation
+conn <- dbConnect(RSQLite::SQLite(), "inside_airbnb.db") # connect to SQLite db, in this case, it created a new db
+
+# ----- Build ETL workflow for listings data
+
+normalise_listings <- function(listings_data) {
+
+  # Manually remove columns that we do not need
+  remove_columns <- c('street', 'neighbourhood', 'latitude','longitude', 'is_location_exact', 'square_feet', 'license', 'calculated_host_listings_count_entire_homes', 'calculated_host_listings_count_private_rooms', 'calculated_host_listings_count_shared_rooms','reviews_per_month', 'last_searched', 'region_id', 'region_name', 'region_parent_id', 'region_parent_name', 'region_parent_parent_id', 'region_parent_parent_name', 'weekly_price', 'monthly_price', 'minimum_nights', 'maximum_nights', 'minimum_minimum_nights', 'maximum_minimum_nights', 'minimum_maximum_nights', 'maximum_maximum_nights', 'has_availability', 'summary', 'description', 'neighborhood_overview', 'space', 'host_listings_count', 'smart_location', 'scrape_id', 'experiences_offered', 'notes', 'access', 'interaction', 'house_rules', 'jurisdiction_names', 'calendar_updated', 'last_review')
+
+  # Listing Table
+  listings_table <- listings_data %>%
+    filter(number_of_reviews > 10) %>%
+    unite(col=new_description,c(summary,description,neighborhood_overview, space),sep = " ", na.rm=TRUE) %>%
+    mutate(lang = cld3::detect_language(new_description)) %>% 
+    filter(lang == 'en') %>%
+    dplyr::rename(listing_id = id) %>%
+    mutate(listing_id = as.character(listing_id),
+           last_scraped = as.character(last_scraped),
+           calendar_last_scraped = as.character(calendar_last_scraped),
+           first_review = as.character(first_review),
+           last_review = as.character(last_review)) %>%
+    select(-c(contains("url"), host_name:host_identity_verified)) %>%
+    select_if(!names(.) %in% remove_columns) %>%
+    mutate(pre_processed = 0)
+    
+  # Host Table
+  host_distinct <- unique(listings_table$host_id)  
+  
+  hosts_table <- listings_data %>%
+    mutate(host_since = as.character(host_since)) %>%
+    filter(host_id %in% host_distinct) %>%
+    select(starts_with('host'), -contains("url")) %>% 
+    distinct(host_id, .keep_all = TRUE)
+  
+  # Insert to db
+  dbWriteTable(conn,"host", hosts_table, append = TRUE)
+  dbWriteTable(conn,"listing", listings_table, append = TRUE)
+}
+```
+
+
+```{r create ETL function for reviews, eval=FALSE}
+# ----- Build ETL workflow for reviews data
+
+normalise_reviews <- function(reviews_data, included_listing) {
+  
+  # Review table
+  reviews_table <- reviews_data %>% 
+    mutate(listing_id = as.character(listing_id),
+           lang = cld3::detect_language(comments),
+           review_date = as.character(date)) %>%
+    filter(listing_id %in% included_listing$listing_id,
+           lang == 'en') %>%
+    dplyr::rename(review_id = id) %>%
+    mutate(review_id = as.character(review_id)) %>%
+    select(-reviewer_name) %>%
+    mutate(pre_processed = 0)
+    
+  # Reviewer Table
+  review_distinct <- unique(reviews_table$review_id)  
+  
+  reviewers_table <- reviews_data %>%
+    dplyr::rename(review_id = id) %>%
+    mutate(review_id = as.character(review_id)) %>%
+    filter(review_id %in% review_distinct) %>%
+    distinct(reviewer_id, reviewer_name)
+    
+  dbWriteTable(conn,"review", reviews_table, append = TRUE)
+  dbWriteTable(conn,"reviewer", reviewers_table, append = TRUE)
+}
+```
+
+
+```{r create ETL function for calendars, eval=FALSE}
+# ----- Build ETL workflow for calendar data
+
+normalise_calendar <- function(calendars_data, included_listing) {
+  
+   remove_columns <- c('adjusted_price', 'minimum_nights', 'maximum_nights', 'available', 'date')
+   
+  # Calendar table
+  calendar_table <- calendars_data %>% 
+    mutate(listing_id = as.character(listing_id)) %>%
+    filter(listing_id %in% included_listing$listing_id, year(date) <= 2019) %>%
+    mutate(booked = ifelse(available==FALSE, 1, 0),
+           price = as.numeric(gsub(",", "", substring(price, 2))),
+           bookingdate = as.character(date)) %>%
+    select_if(!names(.) %in% remove_columns) %>%
+    anti_join(calendar_tracker)
+
+  dbWriteTable(conn,"calendar", calendar_table, append = TRUE)
+  
+  calendar_tracker <- 
+    dbGetQuery(conn,"SELECT distinct listing_id, bookingdate FROM calendar") 
+  
+  assign("calendar_tracker", calendar_tracker, envir = .GlobalEnv)
+}
+```
+
+
+```{r test the functions by using the sample data, eval=FALSE}
+# ----- Automatically use sample data to create schema
+ # normalise_listings(listings_sample)
+
+included_listing <- dbGetQuery(conn, 'SELECT * FROM listing')
+
+```
+```{r test the functions by using the sample data, eval=FALSE}
+normalise_reviews(reviews_sample, included_listing)
+normalise_calendar(calendar_sample, included_listing)
+````
+
+
+```{r ETL run workflow, message=FALSE, eval=FALSE}
+
+start_time <- Sys.time()
+
+# ----- Get the list of files
+listings_list <- list.files("/Users/utility/Desktop/textMining-projects-master/airbnb_file/listings")
+reviews_list <- list.files("/Users/utility/Desktop/textMining-projects-master/airbnb_file/reviews")
+calendar_list <- list.files("/Users/utility/Desktop/textMining-projects-master/airbnb_file/calendar")
+
+# ----- Store listing data into SQL
+for (i in 1:length(listings_list)) {
+  
+  file_path <-paste0("/Users/utility/Desktop/textMining-projects-master/airbnb_file/listings/", listings_list[i])
+  listings_data <- read_csv(file_path)
+  listings_data$file_name <-listings_list[i]
+
+  normalise_listings(listings_data) # call function built especially to normalise listings
+
+}
+
+included_listing <- dbGetQuery(conn, 'SELECT listing_id FROM listing')
+
+# ----- Store review data into SQL
+for (i in 1:length(reviews_list)) {
+  
+  file_path <-paste0("E:/airbnb_file/reviews/", reviews_list[i])
+  reviews_data <- read_csv(file_path)
+  reviews_data$file_name <- reviews_list[i]
+
+  normalise_reviews(reviews_data, included_listing) # call function built especially to normalise listings
+
+}
+
+# ----- Store calendar data into SQL
+calendar_tracker <- data.frame(listing_id=character(), date=as.Date(character())) # create empty df for function normalise_calendar
+
+for (i in 1:length(calendar_list)) {
+  
+  file_path <- paste0("E:/airbnb_file/calendar/", calendar_list[i])
+  calendars_data <- read_csv(file_path)
+  calendars_data$file_name <- calendar_list[i]
+  
+  normalise_calendar(calendars_data, included_listing)
+}
+
+# ----- Check the table lists in SQLite
+dbListTables(conn) # list all table names
+
+end_time <- Sys.time()
+end_time - start_time #record how long it takes
+```
+
+### Data Pre-processing
+
+```{r preparation for pre-processing, eval=FALSE}
+
+# ----- Create a function for negation
+str_negate <- function(x) {
+  gsub("not ","not not",gsub("n't ","n't not",x))
+}
+
+# ----- Create customed stopwords dictionaries
+data("stop_words")
+data("Fry_1000")
+Fry_1000 <- tibble(Fry_1000)
+
+host_name <- 
+  dbGetQuery(conn, 'SELECT distinct host_name FROM host') %>% 
+  rename(word = host_name)
+
+neighbourhood_cleansed <- 
+  dbGetQuery(conn, 'SELECT distinct neighbourhood_cleansed FROM listing WHERE file_name IN ("amsterdam_listings.csv.gz","melbourne_listings.csv.gz", "new york city_listings.csv.gz")') %>% 
+  rename(word = neighbourhood_cleansed)
+
+city_name <- 
+  dbGetQuery(conn, 'SELECT distinct city FROM listing WHERE file_name IN ("amsterdam_listings.csv.gz","melbourne_listings.csv.gz", "new york city_listings.csv.gz")') %>% 
+  rename(word = city)
+
+customed_words <- 
+  tibble(c("can","good","stay","airbnb","apartment","great","everything","really", "airbnb", "bnb", "room", "house", "place", "flat", "accomodation")) 
+  
+colnames(customed_words) <- "word"
+
+# ----- Combine dictionaries into one
+add_words <- 
+  bind_rows(customed_words, city_name, neighbourhood_cleansed, host_name) %>%
+  na.omit()
+
+# ----- Get the udpipe model
+ud_model <- udpipe_download_model(language = "english", overwrite = F)
+ud_model <- udpipe_load_model(ud_model$file_model)
+```
+
+```{r listing pre-processing, eval=FALSE}
+# ----- Initialise While Loop
+
+# calculate how many unprossed rows
+# 38641 observations in total
+query <- dbGetQuery(conn, 'SELECT count(listing_id) FROM listing WHERE pre_processed = 0 AND file_name IN ("amsterdam_listings.csv.gz","melbourne_listings.csv.gz", "new york city_listings.csv.gz")') 
+
+i = 0
+
+
+# ----- Loop until all listing data are processed
+
+while (query > 0) {
+  
+  # Select 1000 oveservations each time
+  
+  df <- dbGetQuery(conn, 'SELECT * FROM listing 
+                   WHERE pre_processed = 0 AND 
+                   file_name IN
+                   ("amsterdam_listings.csv.gz","melbourne_listings.csv.gz", "new york city_listings.csv.gz") 
+                   ORDER BY listing_id 
+                   LIMIT 1000')  
+  
+    
+# ----------------------- DATA PRE-PROCESSING  ------------------
+  
+# Unite text columns in listing 
+description_cleaned <- df %>% 
+    select(listing_id,new_description) %>%
+    unnest_tokens(sentence, new_description, token="sentences",to_lower = FALSE) %>%
+    select(listing_id, sentence) %>%
+    unique() %>%
+    group_by(listing_id) %>%
+    mutate(n = row_number()) %>%
+    spread(n, sentence) %>%
+    unite(new_description_cleaned,na.rm=TRUE,-listing_id)
+
+df <- df %>% left_join(description_cleaned)
+
+rm(description_cleaned)
+
+# Clean the text
+df$new_description_cleaned <-
+  df$new_description_cleaned %>%
+  str_negate() %>%
+  removeNumbers() %>%
+  removePunctuation() %>%
+  replace_white() %>%
+  tolower()
+
+# Tokenize and remove stopwords
+tokens_listing <- 
+  df %>%
+  select(listing_id, new_description_cleaned) %>%
+  unnest_tokens(word, new_description_cleaned) %>%
+  group_by(listing_id, word) %>%
+  count() %>%
+  anti_join(Fry_1000, by = c("word" = "Fry_1000")) %>%
+  anti_join(stop_words) %>%
+  anti_join(add_words)
+
+# Correct the mis-spellings by using the hunspell package
+bad.words <- tokens_listing$word %>%
+  unique() %>%
+  hunspell::hunspell() %>%
+  unlist() %>%
+  unique()
+
+sugg.words <- bad.words %>%
+  hunspell::hunspell_suggest() %>%
+  lapply(function(x) x[1]) %>%
+  unlist() 
+
+word.list <- as.data.frame(cbind(bad.words, sugg.words)) %>%
+  rename(word = bad.words)
+
+tokens_listing <- tokens_listing %>%
+  left_join(word.list)
+
+NA_index <- which(is.na(tokens_listing$sugg.words))
+tokens_listing$sugg.words <- as.character(tokens_listing$sugg.words)
+tokens_listing[NA_index,"sugg.words"] <- tokens_listing[NA_index,"word"]
+
+# Chunk the data to run udpipe efficiently  
+split_size <- 5000
+for_pos_list <- split(tokens_listing,
+                      rep(1:ceiling(nrow(tokens_listing)/split_size), 
+                      each = split_size,
+                      length.out = nrow(tokens_listing)))
+  
+annotated_description <- list()
+
+for(k in 1:length(for_pos_list)){
+    
+    # Annotating
+    this_dataframe <- 
+      udpipe_annotate(for_pos_list[[k]]$sugg.words
+                      doc_id = for_pos_list[[k]]$listing_id,
+                      object = ud_model) %>% 
+      as.data.frame()
+    
+    # Filter out the nouns
+    this_annotated_description <- this_dataframe %>% 
+      filter(upos == "NOUN") %>%
+      select(doc_id,lemma) %>% 
+      group_by(doc_id) %>% 
+      summarise(annotated_description = paste(lemma, collapse = " ")) %>% 
+      rename(listing_id = doc_id)
+    
+    # Store the data into lists we created before for loop
+    annotated_description[[k]] <- this_annotated_description
+   
+    # To check progress
+    print(paste(k,"out of",length(for_pos_list)))
+    }
+    
+# Convert the lists to dataframes
+annotated_description <- data.table::rbindlist(annotated_description)
+
+df <- df %>%
+  select(listing_id, new_description_cleaned)
+
+# Insert into SQLite as new tables
+dbWriteTable(conn, "new_description_cleaned", df, append = TRUE)
+dbWriteTable(conn, "description_udpipe", annotated_description, append = TRUE)
+ 
+# ----- Prepare for the next loop
+dbExecute(conn, 'UPDATE listing SET pre_processed = 1 WHERE listing_id IN 
+                (SELECT listing_id FROM listing
+                 WHERE pre_processed = 0
+                 ORDER BY listing_id
+                 LIMIT 1000)') # updates already processed rows as 1
+  
+  i = i+1    # count iterations
+  print(paste('Listing data chunk',i,'processed')) 
+
+  query <- dbGetQuery(conn, 'SELECT count(listing_id) FROM listing WHERE pre_processed = 0') # recalculate how many unprocessed rows left
+}
+```
+
+
+```{r review pre-processing, eval=FALSE}
+# ----- Initialise While Loop
+
+# 1949150 observations in total
+query <- dbGetQuery(conn, 'SELECT count(review_id) FROM review 
+                    WHERE pre_processed = 0 AND 
+                    file_name IN ("amsterdam_reviews.csv.gz","melbourne_reviews.csv.gz", "new york city_reviews.csv.gz")')
+
+i = 0
+
+# ----- Loop until all reviews data in are processed
+while (query > 0) {
+  
+  # Select 50000 oveservations each time
+  
+  df <- dbGetQuery(conn, 'SELECT * FROM review 
+                   WHERE pre_processed = 0 AND 
+                   file_name IN ("amsterdam_reviews.csv.gz","melbourne_reviews.csv.gz", "new york city_reviews.csv.gz") 
+                   ORDER BY review_id 
+                   limit 50000')  
+  
+            
+# ---------------------- DATA PRE-PROCESSING ---------------------
+  
+  # Set the boundary for comments length
+  review_cleaned <- df %>%
+    mutate(comments_cleaned = comments,
+           comments_semi_cleaned = comments,
+           comments_length = nchar(comments_cleaned)) %>%
+    select(review_id, comments_cleaned, comments_semi_cleaned, comments_length) %>%
+    filter(comments_length > 144 & comments_length < 1000) %>%
+    select(-comments_length)
+  
+  # Clean the text completely
+  review_cleaned$comments_cleaned <- 
+    review_cleaned$comments_cleaned %>%
+    str_negate() %>%
+    removeNumbers() %>%
+    removePunctuation() %>%
+    replace_white() %>%
+    tolower()
+  
+  # Clean the text but not remove punctuation marks and capital letters
+  review_cleaned$comments_semi_cleaned <- 
+    review_cleaned$comments_semi_cleaned %>%
+    str_negate() %>%
+    removeNumbers() %>%
+    replace_white() 
+  
+  df <- df %>%
+    left_join(review_cleaned) %>%
+    na.omit()
+  
+  rm(review_cleaned)
+  
+  # Tokenize and remove stopwords  
+  tokens_review <- df %>%
+    select(listing_id, review_id, comments_cleaned) %>%
+    unnest_tokens(word, comments_cleaned) %>%
+    anti_join(stop_words) %>%
+    anti_join(Fry_1000, by = c("word" = "Fry_1000")) %>%
+    anti_join(add_words)
+  
+  # Correct the mis-spellings by using the hunspell package
+  bad.words <- tokens_review$word %>%
+  unique() %>%
+  hunspell::hunspell() %>%
+  unlist() %>%
+  unique()
+
+  sugg.words <- bad.words %>%
+  hunspell::hunspell_suggest() %>%
+  lapply(function(x) x[1]) %>%
+  unlist() 
+
+  word.list <- as.data.frame(cbind(bad.words, sugg.words)) %>%
+  rename(word = bad.words)
+
+  tokens_review <- tokens_review %>%
+  left_join(word.list)
+
+  NA_index <- which(is.na(tokens_review$sugg.words))
+  tokens_review$sugg.words <- as.character(tokens_review$sugg.words)
+  tokens_review[NA_index,"sugg.words"] <- tokens_review[NA_index,"word"]
+
+  # Chunk the data to run udpipe efficiently  
+  split_size <- 5000
+  for_pos_list <- split(tokens_review,
+                        rep(1:ceiling(nrow(tokens_review)/split_size), 
+                        each = split_size,
+                        length.out = nrow(tokens_review)))
+  
+  annotated_reviews_partb <- list()
+  annotated_reviews_partc <- list()
+  
+  for(k in 1:length(for_pos_list)){
+    
+    # Annotating
+    this_dataframe <- 
+      udpipe_annotate(for_pos_list[[k]]$word,
+                      doc_id = for_pos_list[[k]]$review_id,
+                      object = ud_model) %>% 
+      as.data.frame()
+    
+    # Write the udpipe results into SQLite as a new table
+    dbWriteTable(conn,"review_udipipe_info", this_dataframe, append = TRUE)
+    
+    # Fulfill the requests of part B
+    this_annotated_reviews_partb <- this_dataframe %>% 
+      filter(upos %in% c("ADV","ADJ","NOUN", "AUX", "PART")) %>%
+      select(doc_id,lemma) %>% 
+      group_by(doc_id) %>% 
+      summarise(annotated_comments_partb = paste(lemma, collapse = " ")) %>% 
+      rename(review_id = doc_id)
+    
+    # Fulfill the requests of part C
+    this_annotated_reviews_partc <- this_dataframe %>% 
+      filter(upos == "NOUN") %>%
+      select(doc_id,lemma) %>% 
+      group_by(doc_id) %>% 
+      summarise(annotated_comments_partc = paste(lemma, collapse = " ")) %>% 
+      rename(review_id = doc_id)
+    
+    # Store the data into lists we created before for loop
+    annotated_reviews_partb[[k]] <- this_annotated_reviews_partb
+    annotated_reviews_partc[[k]] <- this_annotated_reviews_partc
+    
+    # To check progress
+    print(paste(k,"out of",length(for_pos_list)))
+    
+    rm(this_annotated_reviews_partb, this_annotated_reviews_partc, this_udipipe_info)
+    }
+    
+  # Convert the lists to dataframes
+  annotated_reviews_partb <- data.table::rbindlist(annotated_reviews_partb)
+  annotated_reviews_partc <- data.table::rbindlist(annotated_reviews_partc)
+  
+  df <- df %>%
+    left_join(annotated_reviews_partb) %>%
+    left_join(annotated_reviews_partc) %>%
+    select(review_id, comments_cleaned, comments_semi_cleaned, annotated_comments_partb, annotated_comments_partc)
+    
+  rm(annotated_reviews_partb, annotated_reviews_partc, tokens_review)
+    
+  # Write the cleased comments into SQLite as a new table
+  dbWriteTable(conn, "comments_cleaned", df, append = TRUE)
+  
+  
+  # ----- Prepare for the next loop
+  dbExecute(conn, 'UPDATE review SET pre_processed = 1 WHERE review_id IN 
+                      (SELECT review_id FROM review
+                      WHERE pre_processed = 0
+                       ORDER BY review_id
+                      LIMIT 50000)') # updates already processed rows as 1
+  
+  i = i+1 # count iterations
+  print(paste('Review data chunk',i,'processed'))
+  
+  query <- dbGetQuery(conn, 'SELECT count(review_id) FROM review WHERE pre_processed = 0') # recalculate how many unprocessed rows left
+
+}
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
